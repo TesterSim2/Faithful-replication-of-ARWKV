@@ -127,10 +127,6 @@ def _flashrnn_chunk_kernel(
 
 
 class RWKV7_TimeMix(nn.Module):
-    """
-    RWKV-7 'Goose' TimeMixing Module.
-    Faithful implementation of Eq. 3 from the ARWKV paper.
-    """
     def __init__(self, layer_id, n_embd, n_head, head_size):
         super().__init__()
         self.layer_id = layer_id
@@ -138,7 +134,6 @@ class RWKV7_TimeMix(nn.Module):
         self.head_size = head_size
         self.time_shift = nn.ZeroPad2d((0, 0, 1, -1))
 
-        # RWKV-7 Parameters
         self.x_r = nn.Parameter(torch.zeros(n_embd))
         self.x_w = nn.Parameter(torch.zeros(n_embd))
         self.x_k = nn.Parameter(torch.zeros(n_embd))
@@ -156,13 +151,20 @@ class RWKV7_TimeMix(nn.Module):
 
         self.ln_x = nn.GroupNorm(n_head, n_embd, eps=1e-5)
 
+        # Zero-Init
+        nn.init.orthogonal_(self.r_proj.weight, gain=0.1)
+        nn.init.orthogonal_(self.k_proj.weight, gain=0.1)
+        nn.init.orthogonal_(self.v_proj.weight, gain=0.1)
+        nn.init.orthogonal_(self.g_proj.weight, gain=0.1)
+        nn.init.constant_(self.w_proj.weight, -3.0)
+        nn.init.zeros_(self.o_proj.weight)
+
     def forward(self, x, state=None):
         B, T, C = x.size()
         H = self.n_head
 
         xx = self.time_shift(x)
-        if state is not None and 'prev_x' in state:
-            xx[:, 0, :] = state['prev_x']
+        if state is not None and 'prev_x' in state: xx[:, 0, :] = state['prev_x']
 
         xr = x + self.x_r * (xx - x)
         xw = x + self.x_w * (xx - x)
@@ -171,27 +173,21 @@ class RWKV7_TimeMix(nn.Module):
         xa = x + self.x_a * (xx - x)
         xg = x + self.x_g * (xx - x)
 
-        r = self.r_proj(xr)
-        w = -torch.exp(self.w_proj(xw))
-        k = self.k_proj(xk)
-        v = self.v_proj(xv)
-        a = torch.sigmoid(self.a_proj(xa))
-        g = torch.sigmoid(self.g_proj(xg))
+        r = self.r_proj(xr); w = -torch.exp(self.w_proj(xw))
+        k = self.k_proj(xk); v = self.v_proj(xv)
+        a = torch.sigmoid(self.a_proj(xa)); g = torch.sigmoid(self.g_proj(xg))
 
-        r = r.view(B, T, H, -1)
-        w = w.view(B, T, H, -1)
-        k = k.view(B, T, H, -1)
-        v = v.view(B, T, H, -1)
-        a = a.view(B, T, H, -1)
-
+        r = r.view(B, T, H, -1); w = w.view(B, T, H, -1)
+        k = k.view(B, T, H, -1); v = v.view(B, T, H, -1)
         w = torch.exp(w)
 
         if state is None or 's' not in state:
             s = torch.zeros(B, H, self.head_size, self.head_size, device=x.device, dtype=x.dtype)
-        else:
-            s = state['s']
+        else: s = state['s']
 
-        x_out, s = self.flashrnn_time_mix(r, w, k, v, s)
+        # CALL PYTORCH IMPLEMENTATION
+        x_out, s = self.pytorch_time_mix(r, w, k, v, s)
+
         x_out = x_out.reshape(B, T, C)
         x_out = self.ln_x(x_out.transpose(1, 2)).transpose(1, 2)
         x_out = x_out * g
@@ -199,55 +195,30 @@ class RWKV7_TimeMix(nn.Module):
 
         return x_out, {'prev_x': x[:, -1, :], 's': s}
 
-    def flashrnn_time_mix(self, r, w, k, v, s):
+    def pytorch_time_mix(self, r, w, k, v, s):
+        # This implementation is Autograd-compatible
+        # We use a sequential loop which is slower but correct for gradients
         B, T, H, D = r.shape
-        chunk = FLASHRNN_CHUNK
-        bh = B * H
-
-        r_flat = r.reshape(bh, T, D).contiguous()
-        w_flat = w.reshape(bh, T, D).contiguous()
-        k_flat = k.reshape(bh, T, D).contiguous()
-        v_flat = v.reshape(bh, T, D).contiguous()
-        out_flat = torch.empty_like(r_flat)
-
-        s_flat = s.reshape(bh, D, D).contiguous()
-
-        grid = (bh,)
-        for start in range(0, T, chunk):
-            chunk_len = min(chunk, T - start)
-            _flashrnn_chunk_kernel[grid](
-                w_flat,
-                k_flat,
-                v_flat,
-                r_flat,
-                s_flat,
-                out_flat,
-                w_flat.stride(0),
-                w_flat.stride(1),
-                w_flat.stride(2),
-                k_flat.stride(0),
-                k_flat.stride(1),
-                k_flat.stride(2),
-                v_flat.stride(0),
-                v_flat.stride(1),
-                v_flat.stride(2),
-                r_flat.stride(0),
-                r_flat.stride(1),
-                r_flat.stride(2),
-                s_flat.stride(0),
-                s_flat.stride(1),
-                s_flat.stride(2),
-                out_flat.stride(0),
-                out_flat.stride(1),
-                out_flat.stride(2),
-                start,
-                chunk_len,
-                D,
-                BLOCK_D=FLASHRNN_BLOCK_D,
-                CHUNK=chunk,
-            )
-
-        return out_flat.reshape(B, T, H, D), s_flat.reshape(B, H, D, D)
+        outs = []
+        
+        # We iterate over T. For better speed, use torch.compile on this method
+        for t in range(T):
+            w_t = w[:, t]
+            k_t = k[:, t]
+            v_t = v[:, t]
+            r_t = r[:, t]
+            
+            # State Update: s = s * w + v @ k.T
+            # w is [B, H, D], s is [B, H, D, D]
+            # We treat w as diagonal decay
+            s = s * w_t.unsqueeze(-1) + torch.einsum('bhd,bhz->bhdz', v_t, k_t)
+            
+            # Output: y = s @ r
+            y = torch.einsum('bhdz,bhz->bhd', s, r_t)
+            outs.append(y)
+            
+        out = torch.stack(outs, dim=1)
+        return out, s
 
 class AttentionWrapper(nn.Module):
     """
