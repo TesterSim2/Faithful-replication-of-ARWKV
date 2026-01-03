@@ -3,7 +3,7 @@
 # ==============================================================================
 # Fixes:
 # 1. Correctly handles Qwen2Attention return tuple (2 items instead of 3).
-# 2. Includes RoPE position_embeddings capture and passing.
+# 2. Implements JIT layer-wise distillation without storing full-graph activations.
 # 3. Includes Manual Causal Mask expansion.
 # ==============================================================================
 
@@ -251,7 +251,7 @@ class RWKV7_TimeMix(nn.Module):
 
 class AttentionWrapper(nn.Module):
     """
-    Updated Wrapper that accepts 'position_embeddings' and handles Qwen2 return type correctly.
+    Updated Wrapper that accepts explicit rotary position ids and handles Qwen2 return type correctly.
     """
     def __init__(self, qwen_layer, rwkv_layer, d_model):
         super().__init__()
@@ -265,7 +265,7 @@ class AttentionWrapper(nn.Module):
         for p in self.teacher_norm.parameters():
             p.requires_grad = False
 
-    def forward(self, hidden_states, attention_mask=None, position_embeddings=None):
+    def forward(self, hidden_states, attention_mask=None, position_ids=None, cache_position=None):
         normed_states = self.teacher_norm(hidden_states)
 
         with torch.no_grad():
@@ -274,40 +274,14 @@ class AttentionWrapper(nn.Module):
             teacher_out = self.teacher_attn(
                 hidden_states=normed_states,
                 attention_mask=attention_mask,
-                position_embeddings=position_embeddings
+                position_ids=position_ids,
+                cache_position=cache_position
             )[0]
 
         student_out, _ = self.student_mixer(normed_states)
         diff = teacher_out - student_out
         loss = torch.norm(diff, p=2, dim=-1).mean() * (self.d_model ** -0.5)
         return loss, student_out
-
-class InputRecorder:
-    """
-    Captures hidden_states and position_embeddings entering the layer.
-    """
-    def __init__(self, model):
-        self.inputs = {}
-        self.hooks = []
-        self.model = model
-
-    def _get_hook(self, layer_idx):
-        def hook(module, args, kwargs, output):
-            hs = args[0].detach()
-            pe = kwargs.get('position_embeddings', None)
-            self.inputs[layer_idx] = (hs, pe)
-        return hook
-
-    def register(self):
-        for i, layer in enumerate(self.model.model.layers):
-            h = layer.register_forward_hook(self._get_hook(i), with_kwargs=True)
-            self.hooks.append(h)
-
-    def remove(self):
-        for h in self.hooks:
-            h.remove()
-        self.hooks = []
-        self.inputs = {}
 
 # ==============================================================================
 # 3. PIPELINE BUILDER & DATA
@@ -406,10 +380,7 @@ def train_stage_1(teacher_model, wrappers, dataloader, device="cuda", steps=100)
         student_params.extend(w.student_mixer.parameters())
 
     optimizer = optim.AdamW(student_params, lr=1e-3, betas=(0.9, 0.99))
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps)
-
-    recorder = InputRecorder(teacher_model)
-    recorder.register()
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=steps * len(wrappers))
 
     progress_bar = tqdm(range(steps))
     data_iter = iter(dataloader)
@@ -424,44 +395,55 @@ def train_stage_1(teacher_model, wrappers, dataloader, device="cuda", steps=100)
         input_ids = batch['input_ids'].to(device)
         raw_mask = batch['attention_mask'].to(device)
 
-        optimizer.zero_grad()
-
-        # A. Feed Teacher
         with torch.no_grad():
-            _ = teacher_model(input_ids, attention_mask=raw_mask, output_hidden_states=True)
+            inputs_embeds = teacher_model.model.embed_tokens(input_ids)
+            expanded_mask = _prepare_4d_causal_attention_mask(
+                attention_mask=raw_mask,
+                input_shape=(input_ids.shape[0], input_ids.shape[1]),
+                inputs_embeds=inputs_embeds,
+                past_key_values_length=0,
+            )
+            seq_len = input_ids.shape[1]
+            cache_position = torch.arange(seq_len, device=device)
+            position_ids = cache_position.unsqueeze(0).expand(input_ids.shape[0], -1)
+            teacher_hidden = inputs_embeds
 
-        # B. Prepare Mask for Students (Batch, 1, Seq, Seq)
-        expanded_mask = _prepare_4d_causal_attention_mask(
-            attention_mask=raw_mask,
-            input_shape=(input_ids.shape[0], input_ids.shape[1]),
-            inputs_embeds=teacher_model.model.embed_tokens(input_ids),
-            past_key_values_length=0,
-        )
+        for layer_idx, wrapper in enumerate(wrappers):
+            optimizer.zero_grad()
 
-        # C. Feed Students
-        total_loss = 0
-        for i, wrapper in enumerate(wrappers):
-            teacher_input, teacher_pos_emb = recorder.inputs[i]
+            teacher_input = teacher_hidden
+
+            with torch.no_grad():
+                teacher_layer = teacher_model.model.layers[layer_idx]
+                teacher_output = teacher_layer(
+                    teacher_input,
+                    attention_mask=expanded_mask,
+                    position_ids=position_ids,
+                    output_attentions=False,
+                    use_cache=False,
+                    cache_position=cache_position,
+                )
+                teacher_hidden = teacher_output[0]
 
             loss, _ = wrapper(
                 teacher_input,
                 attention_mask=expanded_mask,
-                position_embeddings=teacher_pos_emb
+                position_ids=position_ids,
+                cache_position=cache_position
             )
-            total_loss += loss
 
-        # D. Update
-        avg_loss = total_loss / len(wrappers)
-        avg_loss.backward()
+            loss.backward()
 
-        torch.nn.utils.clip_grad_norm_(student_params, 1.0)
-        optimizer.step()
-        scheduler.step()
+            torch.nn.utils.clip_grad_norm_(wrapper.student_mixer.parameters(), 1.0)
+            optimizer.step()
+            scheduler.step()
 
-        recorder.inputs = {}
-        progress_bar.set_description(f"Loss: {avg_loss.item():.4f}")
+            progress_bar.set_description(f"Layer {layer_idx} Loss: {loss.item():.4f}")
 
-    recorder.remove()
+            del teacher_output, loss
+            if device.startswith("cuda"):
+                torch.cuda.empty_cache()
+
     print("Stage 1 Training Complete.")
     return wrappers
 
