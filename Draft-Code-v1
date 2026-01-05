@@ -50,6 +50,7 @@ def _flashrnn_chunk_kernel(
     k_ptr,
     v_ptr,
     r_ptr,
+    a_ptr,
     s_ptr,
     out_ptr,
     stride_w_bh,
@@ -64,6 +65,9 @@ def _flashrnn_chunk_kernel(
     stride_r_bh,
     stride_r_t,
     stride_r_d,
+    stride_a_bh,
+    stride_a_t,
+    stride_a_d,
     stride_s_bh,
     stride_s_row,
     stride_s_col,
@@ -96,6 +100,7 @@ def _flashrnn_chunk_kernel(
         k_offset = pid * stride_k_bh + base * stride_k_t
         v_offset = pid * stride_v_bh + base * stride_v_t
         r_offset = pid * stride_r_bh + base * stride_r_t
+        a_offset = pid * stride_a_bh + base * stride_a_t
 
         w_t = tl.load(
             w_ptr + w_offset + d, mask=dim_mask & active, other=1.0
@@ -109,21 +114,26 @@ def _flashrnn_chunk_kernel(
         r_t = tl.load(
             r_ptr + r_offset + d, mask=dim_mask & active, other=0.0
         ).to(tl.float32)
+        a_t = tl.load(
+            a_ptr + a_offset + d, mask=dim_mask & active, other=0.0
+        ).to(tl.float32)
 
-        s = s * w_t[:, None] + v_t[:, None] * k_t[None, :]
+        sa = tl.sum(s * k_t[None, :], axis=1)
+        s = s * w_t[None, :]
+        kk = k_t * a_t
+        s = s + (v_t[:, None] * k_t[None, :]) - (sa[:, None] * kk[None, :])
         y = tl.sum(s * r_t[None, :], axis=1)
 
         out_offset = pid * stride_out_bh + base * stride_out_t
         tl.store(
-    out_ptr + out_offset + d,
-    y.to(tl.bfloat16),
-    mask=dim_mask & active,)
+            out_ptr + out_offset + d, y.to(tl.bfloat16), mask=dim_mask & active
+        )
 
     tl.store(
-    s_ptr + state_offsets,
-    s.to(tl.bfloat16), # Assuming state is stored in BF16
-    mask=(rows < D) & (cols < D),
-)
+        s_ptr + state_offsets,
+        s.to(tl.bfloat16),
+        mask=(rows < D) & (cols < D),
+    )
 
 
 class RWKV7_TimeMix(nn.Module):
@@ -179,14 +189,17 @@ class RWKV7_TimeMix(nn.Module):
 
         r = r.view(B, T, H, -1); w = w.view(B, T, H, -1)
         k = k.view(B, T, H, -1); v = v.view(B, T, H, -1)
+        a = a.view(B, T, H, -1)
         w = torch.exp(w)
 
         if state is None or 's' not in state:
             s = torch.zeros(B, H, self.head_size, self.head_size, device=x.device, dtype=x.dtype)
         else: s = state['s']
 
-        # CALL PYTORCH IMPLEMENTATION
-        x_out, s = self.pytorch_time_mix(r, w, k, v, s)
+        if r.is_cuda:
+            x_out, s = self.flashrnn_time_mix(r, w, k, v, a, s)
+        else:
+            x_out, s = self.pytorch_time_mix(r, w, k, v, a, s)
 
         x_out = x_out.reshape(B, T, C)
         x_out = self.ln_x(x_out.transpose(1, 2)).transpose(1, 2)
@@ -195,7 +208,7 @@ class RWKV7_TimeMix(nn.Module):
 
         return x_out, {'prev_x': x[:, -1, :], 's': s}
 
-    def pytorch_time_mix(self, r, w, k, v, s):
+    def pytorch_time_mix(self, r, w, k, v, a, s):
         # This implementation is Autograd-compatible
         # We use a sequential loop which is slower but correct for gradients
         B, T, H, D = r.shape
@@ -207,11 +220,14 @@ class RWKV7_TimeMix(nn.Module):
             k_t = k[:, t]
             v_t = v[:, t]
             r_t = r[:, t]
+            a_t = a[:, t]
             
-            # State Update: s = s * w + v @ k.T
-            # w is [B, H, D], s is [B, H, D, D]
-            # We treat w as diagonal decay
-            s = s * w_t.unsqueeze(-1) + torch.einsum('bhd,bhz->bhdz', v_t, k_t)
+            # State Update: s = s * w + v @ k.T - (s @ k) * (a * k).T
+            s = s * w_t.unsqueeze(-2)
+            sa = torch.einsum('bhdz,bhz->bhd', s, k_t)
+            s = s + torch.einsum('bhd,bhz->bhdz', v_t, k_t) - torch.einsum(
+                'bhd,bhz->bhdz', sa, a_t * k_t
+            )
             
             # Output: y = s @ r
             y = torch.einsum('bhdz,bhz->bhd', s, r_t)
@@ -219,6 +235,36 @@ class RWKV7_TimeMix(nn.Module):
             
         out = torch.stack(outs, dim=1)
         return out, s
+
+    def flashrnn_time_mix(self, r, w, k, v, a, s):
+        B, T, H, D = r.shape
+        bh = B * H
+
+        r_flat = r.reshape(bh, T, D).contiguous()
+        w_flat = w.reshape(bh, T, D).contiguous()
+        k_flat = k.reshape(bh, T, D).contiguous()
+        v_flat = v.reshape(bh, T, D).contiguous()
+        a_flat = a.reshape(bh, T, D).contiguous()
+        s_flat = s.reshape(bh, D, D).contiguous()
+        out_flat = torch.empty_like(r_flat)
+
+        chunk = FLASHRNN_CHUNK
+        grid = (bh,)
+        for start in range(0, T, chunk):
+            chunk_len = min(chunk, T - start)
+            _flashrnn_chunk_kernel[grid](
+                w_flat, k_flat, v_flat, r_flat, a_flat, s_flat, out_flat,
+                w_flat.stride(0), w_flat.stride(1), w_flat.stride(2),
+                k_flat.stride(0), k_flat.stride(1), k_flat.stride(2),
+                v_flat.stride(0), v_flat.stride(1), v_flat.stride(2),
+                r_flat.stride(0), r_flat.stride(1), r_flat.stride(2),
+                a_flat.stride(0), a_flat.stride(1), a_flat.stride(2),
+                s_flat.stride(0), s_flat.stride(1), s_flat.stride(2),
+                out_flat.stride(0), out_flat.stride(1), out_flat.stride(2),
+                start, chunk_len, D, BLOCK_D=FLASHRNN_BLOCK_D, CHUNK=chunk,
+            )
+
+        return out_flat.reshape(B, T, H, D), s_flat.reshape(B, H, D, D)
 
 class AttentionWrapper(nn.Module):
     """
